@@ -325,22 +325,25 @@ def _set_meter_session_start(start_wh: int):
     measured_power_w = 0
 
 
-def _update_meter_state(reading_wh: int):
+def _update_meter_state(reading_wh: int) -> int:
     global meter_wh, last_meter_read_wh, last_meter_read_ts, measured_power_w
 
     now = time.time()
+    reported_wh = reading_wh
     if last_meter_read_wh is not None and last_meter_read_ts is not None:
         elapsed = now - last_meter_read_ts
         delta_wh = reading_wh - last_meter_read_wh
         if delta_wh < 0:
-            log("WARN", f"Sayac degeri azaldi: onceki={last_meter_read_wh} Wh, yeni={reading_wh} Wh")
+            log("WARN", f"Sayac degeri azaldi: onceki={last_meter_read_wh} Wh, yeni={reading_wh} Wh; son gecerli deger korunuyor")
             delta_wh = 0
+            reported_wh = last_meter_read_wh
         if elapsed > 0:
             measured_power_w = int(round((delta_wh * 3600) / elapsed))
 
-    meter_wh = reading_wh
-    last_meter_read_wh = reading_wh
+    meter_wh = reported_wh
+    last_meter_read_wh = reported_wh
     last_meter_read_ts = now
+    return reported_wh
 
 
 async def read_meter_wh_async():
@@ -354,9 +357,12 @@ async def read_actual_meter(context: str):
         log("ERR", f"{context}: sayac okunamadi")
         return None
 
-    _update_meter_state(reading_wh)
-    log("INFO", f"{context}: sayac={reading_wh} Wh, kullanim={session_energy_kwh():.3f} kWh")
-    return reading_wh
+    reported_wh = _update_meter_state(reading_wh)
+    if reported_wh != reading_wh:
+        log("INFO", f"{context}: sayac={reading_wh} Wh, gonderilecek={reported_wh} Wh, kullanim={session_energy_kwh():.3f} kWh")
+    else:
+        log("INFO", f"{context}: sayac={reading_wh} Wh, kullanim={session_energy_kwh():.3f} kWh")
+    return reported_wh
 
 
 def session_energy_kwh() -> float:
