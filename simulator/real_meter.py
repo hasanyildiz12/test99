@@ -22,7 +22,7 @@ except Exception:
     pass
 
 
-PORT = os.environ.get("METER_PORT", "COM6")
+PORT = os.environ.get("METER_PORT", "/dev/ttyUSB0")
 SLAVE_ID = int(os.environ.get("METER_SLAVE_ID", "1"))
 
 BAUDRATE = int(os.environ.get("METER_BAUDRATE", "9600"))
