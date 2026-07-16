@@ -38,6 +38,14 @@ METER_INCREMENT_WH = 500   # Wh added on every MeterValues call  →  %5 = 500 W
 DEFAULT_VOLTAGE    = 230   # V
 DEFAULT_CURRENT    = 16    # A
 
+# --- CP Signal / ADS1115 ---
+
+CP_ADC_ENABLED      = True
+CP_ADC_CHANNEL      = 0
+CP_ADC_GAIN         = 1
+CP_VOLTAGE_DIVIDER  = 4.0303
+CP_STATUS_INTERVAL  = 0.5   # seconds
+
 # ─── OCPP Protocol ───────────────────────────────────────────────────────────
 
 SUBPROTOCOL   = "ocpp1.6"

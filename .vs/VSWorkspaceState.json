@@ -1,4 +1,10 @@
 {
-  "ExpandedNodes": [],
+  "ExpandedNodes": [
+    "",
+    "\\config",
+    "\\docs",
+    "\\simulator"
+  ],
+  "SelectedNode": "\\config",
   "PreviewInSolutionExplorer": false
 }

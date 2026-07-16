@@ -41,6 +41,11 @@ from config import (
     HEARTBEAT_INTERVAL,
     DEFAULT_VOLTAGE,
     DEFAULT_CURRENT,
+    CP_ADC_ENABLED,
+    CP_ADC_CHANNEL,
+    CP_ADC_GAIN,
+    CP_VOLTAGE_DIVIDER,
+    CP_STATUS_INTERVAL,
     SUBPROTOCOL,
     PING_INTERVAL,
     BASIC_AUTH_USER,
@@ -56,6 +61,11 @@ try:
     from real_meter import close_meter, configure_meter_logger, read_meter_wh
 except ImportError:
     from simulator.real_meter import close_meter, configure_meter_logger, read_meter_wh
+
+try:
+    from cp_signal import CpSignalReader
+except ImportError:
+    from simulator.cp_signal import CpSignalReader
 
 # ─── Runtime State ────────────────────────────────────────────────────────────
 
@@ -77,6 +87,12 @@ charging_active      = False    # şarj devam ediyor mu?
 # Bağlantı durumu
 is_connected = False
 current_status = "NOT CONNECTED"
+
+# CP/ADS1115 status source
+cp_reader = None
+cp_status_source_active = False
+last_cp_status = None
+last_cp_gap_log_ts = 0.0
 
 # ─── ANSI Renk Kodları ────────────────────────────────────────────────────────
 
@@ -101,6 +117,65 @@ def log(direction: str, msg: str):
 
 configure_meter_logger(log)
 atexit.register(close_meter)
+
+
+def init_cp_status_source() -> bool:
+    """Start ADS1115 CP status source if hardware is available."""
+    global cp_reader, cp_status_source_active
+
+    if not CP_ADC_ENABLED:
+        log("INFO", "CP ADC disabled; Nextion status uses simulator events")
+        return False
+
+    reader = CpSignalReader(
+        channel=CP_ADC_CHANNEL,
+        gain=CP_ADC_GAIN,
+        voltage_multiplier=CP_VOLTAGE_DIVIDER,
+    )
+
+    try:
+        reading = reader.read()
+    except Exception as e:
+        cp_reader = None
+        cp_status_source_active = False
+        log("WARN", f"CP ADC unavailable: {e}; Nextion status uses simulator events")
+        return False
+
+    cp_reader = reader
+    cp_status_source_active = True
+    log("INFO", f"CP ADC ready: adc={reading.adc_voltage:.2f}V cp={reading.cp_voltage:.2f}V status={reading.status or 'hold'}")
+
+    if reading.status:
+        nxt_set_status(reading.status)
+
+    return True
+
+
+async def cp_status_loop():
+    """Update home con.txt from ADS1115 CP voltage."""
+    global last_cp_status, last_cp_gap_log_ts
+
+    if not cp_status_source_active or cp_reader is None:
+        return
+
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            reading = await loop.run_in_executor(None, cp_reader.read)
+            if reading.status:
+                if reading.status != last_cp_status:
+                    log("INFO", f"CP status -> {reading.status} ({reading.cp_voltage:.2f} V)")
+                    last_cp_status = reading.status
+                nxt_set_status(reading.status)
+            else:
+                now = time.time()
+                if now - last_cp_gap_log_ts >= 5:
+                    log("WARN", f"CP voltage outside status bands: {reading.cp_voltage:.2f} V; keeping {current_status}")
+                    last_cp_gap_log_ts = now
+        except Exception as e:
+            log("WARN", f"CP ADC read error: {e}")
+
+        await asyncio.sleep(CP_STATUS_INTERVAL)
 
 
 # ─── NFC Kimlik Doğrulama ─────────────────────────────────────────────────────
@@ -187,31 +262,41 @@ def nxt_set_time():
 def nxt_set_status(status: str):
     """
     home sayfası con objesi + araba görseli.
-    status: 'NOT CONNECTED' | 'CONNECTED' | 'AVAILABLE' | 'CHARGING'
+    status: 'NOT CONNECTED' | 'CONNECTED' | 'AVAILABLE' | 'CHARGING' | 'VENTILATION' | 'FAULT'
     """
     global current_status
-    current_status = status
+    normalized = (status or "NOT CONNECTED").strip().upper()
+    current_status = normalized
     
     colors = {
         "NOT CONNECTED": 63488,   # kırmızı
         "CONNECTED":     2047,    # cyan
         "AVAILABLE":     2047,    # cyan
-        "CHARGING":      11939,   # yeşil
+        "CHARGING":      11939,   # green
+        "VENTILATION":   65504,   # yellow
+        "FAULT":         63488,   # red
+        "UNAVAILABLE":   63488,   # red
     }
     
     # Ekranda göstereceğimiz yazıyı belirleme
-    text_to_show = status
-    if status == "CONNECTED":
-        text_to_show = "AVAILABLE"  # WebSocket bağlı ama idle
-
-    if status == "CHARGING":
+    display_text = {
+        "NOT CONNECTED": "Not Connected",
+        "CONNECTED":     "Connected",
+        "AVAILABLE":     "Available",
+        "CHARGING":      "Charging",
+        "VENTILATION":   "Ventilation",
+        "FAULT":         "Fault",
+        "UNAVAILABLE":   "Unavailable",
+    }
+    text_to_show = display_text.get(normalized, normalized.title())
+    if normalized == "CHARGING":
         pic = 0
-    elif status == "NOT CONNECTED":
+    elif normalized in ("NOT CONNECTED", "FAULT", "UNAVAILABLE"):
         pic = PIC_CAR_DISCONNECTED
     else:
         pic = PIC_CAR_CONNECTED
 
-    pco = colors.get(status, 63488)
+    pco = colors.get(normalized, 63488)
     nxt(f'con.txt="{text_to_show}"')
     nxt(f"con.pco={pco}")
     nxt(f"araba.pic={pic}")
@@ -407,8 +492,9 @@ async def status_notification(ws, connector_id: int, status: str, error_code: st
         "errorCode":   error_code,
         "timestamp":   iso_now(),
     })
-    # Nextion con objesini OCPP status ile güncelle
-    nxt_set_status(status.upper())
+    # ADS1115 aktif degilse eski OCPP kaynakli ekran davranisi yedekte kalir.
+    if not cp_status_source_active:
+        nxt_set_status(status.upper())
 
 
 async def authorize(ws, id_tag: str = USER_ID_TAG):
@@ -421,7 +507,8 @@ async def start_transaction(ws, id_tag: str = USER_ID_TAG):
     start_wh = await read_meter_wh_async()
     if start_wh is None:
         log("ERR", "StartTransaction iptal: sayac okunamadi, simule enerji gonderilmeyecek")
-        nxt_set_status("AVAILABLE")
+        if not cp_status_source_active:
+            nxt_set_status("AVAILABLE")
         nxt_update_status()
         return
 
@@ -430,7 +517,8 @@ async def start_transaction(ws, id_tag: str = USER_ID_TAG):
     charge_start_time = time.time()
     transaction_end_time = None
     charging_active   = True
-    nxt_set_status("CHARGING")
+    if not cp_status_source_active:
+        nxt_set_status("CHARGING")
     nxt_update_status() # Reset UI quickly
     await send(ws, "StartTransaction", {
         "connectorId": 1,
@@ -457,7 +545,8 @@ async def stop_transaction(ws):
     
     charging_active = False
     transaction_end_time = time.time()
-    nxt_set_status("AVAILABLE")
+    if not cp_status_source_active:
+        nxt_set_status("AVAILABLE")
     
     await send(ws, "StopTransaction", {
         "transactionId": transaction_id,
@@ -685,6 +774,8 @@ async def main():
     nxt_set_time()
     # NFC doğrulaması geçildi → config'deki idTag'i ana sayfa userinfo.txt'e yaz
     nxt_set_user_id(USER_ID_TAG)
+    init_cp_status_source()
+    cp_task = None
 
     def handle_sigint(*_):
         log("INFO", "Ctrl+C — bağlantı kesiliyor...")
@@ -693,6 +784,9 @@ async def main():
         time.sleep(0.5)
         sys.exit(0)
     signal.signal(signal.SIGINT, handle_sigint)
+
+    if cp_status_source_active:
+        cp_task = asyncio.create_task(cp_status_loop())
 
     try:
         _credentials = base64.b64encode(
@@ -709,7 +803,8 @@ async def main():
             log("INFO", f"Bağlandı ✓  ({CSMS_URL})")
 
             # Nextion'ı güncelle — bağlantı kurulunca otomatik
-            nxt_set_status("CONNECTED")
+            if not cp_status_source_active:
+                nxt_set_status("CONNECTED")
             nxt_set_user_id(USER_ID_TAG)   # ana sayfa userinfo objesi kalıcı yazılır
 
             # Otomatik BootNotification
@@ -731,10 +826,15 @@ async def main():
     except OSError as e:
         log("ERR", f"Bağlantı başarısız: {e}")
         log("INFO", "CSMS çalışıyor mu? URL doğru mu?")
-        nxt_set_status("NOT CONNECTED")
+        if not cp_status_source_active:
+            nxt_set_status("NOT CONNECTED")
     except Exception as e:
         log("ERR", f"Beklenmeyen hata: {e}")
-        nxt_set_status("NOT CONNECTED")
+        if not cp_status_source_active:
+            nxt_set_status("NOT CONNECTED")
+    finally:
+        if cp_task:
+            cp_task.cancel()
 
 
 # ─── Giriş Noktası ────────────────────────────────────────────────────────────
